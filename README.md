@@ -20,8 +20,9 @@ pip install -r requirements.txt
 Scripts\streamlit.exe run logistigo.py
 ```
 
-Use the environment's own `streamlit` (as above, or after activating). A system-wide `streamlit`
-won't have the app's packages and fails with `ModuleNotFoundError: No module named 'folium'`.
+Run it from this folder: Streamlit reads the theme in `.streamlit/config.toml` from the folder you
+start it in. Use the environment's own `streamlit` (as above, or after activating). A system-wide
+`streamlit` won't have the app's packages and fails with `ModuleNotFoundError: No module named 'folium'`.
 
 The app opens at http://localhost:8501 and needs internet access (OSRM for road routing,
 Nominatim for place search).
