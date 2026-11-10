@@ -1,0 +1,20 @@
+# This folder is also the Python virtualenv. Only the app's own files are tracked;
+# the environment itself is recreated with: python -m venv . && pip install -r requirements.txt
+Lib/
+Include/
+Scripts/
+share/
+etc/
+pyvenv.cfg
+
+# Local data: user accounts (password hashes), delivery history, backups
+*.db
+*.db.bak
+*.bak
+*.csv
+
+# Python / Streamlit
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/secrets.toml
