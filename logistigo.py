@@ -4,6 +4,8 @@ import hmac
 import html
 import secrets
 import sqlite3
+import threading
+import time
 from datetime import datetime
 from urllib.parse import urlencode
 
@@ -15,6 +17,8 @@ import streamlit as st
 from folium.plugins import HeatMap
 from geopy.distance import geodesic
 from streamlit_folium import st_folium
+
+from stop_import import MAX_STOPS, parse_stops_file, template_csv
 
 st.set_page_config(page_title="Logistigo", page_icon=":material/local_shipping:", layout="wide")
 
@@ -127,9 +131,24 @@ def login_user(username, password):
 # ---------------------------------------------------------------------------
 # Network helpers
 # ---------------------------------------------------------------------------
+@st.cache_resource
+def _nominatim_throttle():
+    # Shared across sessions: Nominatim's usage policy allows at most 1 request per second.
+    return {"lock": threading.Lock(), "last": 0.0}
+
+
+GEOCODE_INTERVAL_S = float(os.environ.get("LOGISTIGO_GEOCODE_INTERVAL", "1.0"))
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def _geocode_cached(location_name):
     # Network errors raise, so they are not cached; "not found" is cached.
+    throttle = _nominatim_throttle()
+    with throttle["lock"]:
+        wait = GEOCODE_INTERVAL_S - (time.monotonic() - throttle["last"])
+        if wait > 0:
+            time.sleep(wait)
+        throttle["last"] = time.monotonic()
     response = requests.get(
         NOMINATIM_URL,
         params={"format": "json", "q": location_name, "limit": 1},
@@ -203,11 +222,12 @@ def distance_matrix(points):
 # ---------------------------------------------------------------------------
 # Route planning
 # ---------------------------------------------------------------------------
-def plan_routes(dist, volumes, priorities, capacities, time_limit_s=3):
+def plan_routes(dist, volumes, priorities, capacities, time_limit_s=3, strict_priority=False):
     """Capacitated vehicle routing from depot (node 0) to stops 1..n, open routes
     (vehicles don't return to the depot). Minimises road distance, nudges
     high/medium priority stops earlier in their route, and drops stops only when
-    they cannot fit (low priority dropped first).
+    they cannot fit (low priority dropped first). With strict_priority, every
+    route visits all its high stops, then medium, then low.
     Returns (routes, dropped) as lists of stop indices (0-based, into volumes)."""
     n_stops = len(volumes)
     demands = [0] + [int(round(v * VOLUME_SCALE)) for v in volumes]
@@ -239,6 +259,15 @@ def plan_routes(dist, volumes, priorities, capacities, time_limit_s=3):
         if lateness_cost[priorities[stop]]:
             order_dim.SetCumulVarSoftUpperBound(index, 0, lateness_cost[priorities[stop]])
         routing.AddDisjunction([index], drop_penalty[priorities[stop]])
+
+    if strict_priority:
+        # Forbid driving from a stop straight to a more urgent one. A route that visited a
+        # lower-priority stop before a higher one would need such a step somewhere, so this
+        # makes every route run high -> medium -> low.
+        for a in range(n_stops):
+            for b in range(n_stops):
+                if PRIORITY_RANK[priorities[b]] < PRIORITY_RANK[priorities[a]]:
+                    routing.NextVar(manager.NodeToIndex(a + 1)).RemoveValue(manager.NodeToIndex(b + 1))
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -487,6 +516,8 @@ def page_plan():
     st.header("Plan routes")
     st.caption("Enter a depot, your vehicles and the stops for the day. Routes are planned when you submit.")
 
+    import_stops_panel()
+
     with st.form("plan_form"):
         left, right = st.columns([1, 2], gap="large")
         with left:
@@ -496,6 +527,10 @@ def page_plan():
             delivery_date = st.date_input("Delivery date", datetime.today(), key="delivery_date")
             km_per_litre = st.number_input("Fuel efficiency (km/L)", min_value=0.1, value=8.0, step=0.5,
                                            key="km_per_litre")
+            strict_priority = st.toggle(
+                "High priority first", key="strict_priority",
+                help="Each vehicle visits all its high-priority stops, then medium, then low. "
+                     "Off: priority only nudges the order, so a short detour can come first.")
             st.subheader("Fleet")
             vehicles = st.data_editor(
                 st.session_state.get("vehicles_input", DEFAULT_VEHICLES), key="vehicles_editor",
@@ -508,8 +543,10 @@ def page_plan():
             )
         with right:
             st.subheader("Stops")
+            # The key changes after each import so the table starts fresh with the imported rows.
             stops_df = st.data_editor(
-                st.session_state.get("stops_input", DEFAULT_STOPS), key="stops_editor",
+                st.session_state.get("stops_input", DEFAULT_STOPS),
+                key=f"stops_editor_{st.session_state.get('stops_version', 0)}",
                 num_rows="dynamic", hide_index=True, use_container_width=True,
                 column_config={
                     "Location": st.column_config.TextColumn(width="medium"),
@@ -523,14 +560,46 @@ def page_plan():
         submitted = st.form_submit_button("Plan routes", type="primary")
 
     if submitted:
-        run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df)
+        run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df, strict_priority)
 
     result = st.session_state.get("result")
     if result:
         show_result(result)
 
 
-def run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df):
+def import_stops_panel():
+    """Upload a CSV/Excel file of stops; it replaces the Stops table so it can be reviewed before planning."""
+    with st.expander("Import stops from a file"):
+        st.caption(f"CSV or Excel with a Location column, plus optional Priority (High, Medium or Low) and "
+                   f"Volume (m³) columns. Up to {MAX_STOPS} stops. Importing replaces the stops in the table below.")
+        upload_col, template_col = st.columns([3, 1], vertical_alignment="bottom")
+        uploaded = upload_col.file_uploader("Stops file", type=["csv", "xlsx"], key="stops_file",
+                                            label_visibility="collapsed")
+        template_col.download_button("Download template", template_csv(), file_name="stops-template.csv",
+                                     mime="text/csv", use_container_width=True)
+        if uploaded is None:
+            return
+        file_id = (uploaded.name, uploaded.size, getattr(uploaded, "file_id", None))
+        if st.session_state.get("imported_file") != file_id:  # only import each upload once
+            try:
+                stops, notes = parse_stops_file(uploaded.name, uploaded.getvalue())
+            except ValueError as e:
+                st.session_state.import_message = ("error", str(e), [])
+            else:
+                st.session_state.stops_input = stops
+                st.session_state.stops_version = st.session_state.get("stops_version", 0) + 1
+                st.session_state.import_message = (
+                    "success", f"Imported {len(stops)} stops from {uploaded.name}. Review them below, "
+                               "then plan routes.", notes)
+            st.session_state.imported_file = file_id
+        kind, text, notes = st.session_state.get("import_message", ("success", "", []))
+        if text:
+            (st.error if kind == "error" else st.success)(text)
+        for note in notes:
+            st.warning(note)
+
+
+def run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df, strict_priority=False):
     vehicles = vehicles.dropna()
     vehicles = vehicles[vehicles["Vehicle"].astype(str).str.strip() != ""]
     vehicle_names = vehicles["Vehicle"].astype(str).str.strip().tolist()
@@ -579,7 +648,7 @@ def run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df):
 
     with st.spinner("Planning routes…"):
         dist = distance_matrix([start] + stops)
-        routes, dropped = plan_routes(dist, volumes, priorities, capacities)
+        routes, dropped = plan_routes(dist, volumes, priorities, capacities, strict_priority=strict_priority)
         m = build_map(start, stops, names, priorities, routes, vehicle_names)
         opt_info, opt_total = add_routes_to_map(m, start, stops, routes, names, vehicle_names, "Optimised")
         served = [s for route in routes for s in route]
@@ -618,7 +687,8 @@ def run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df):
     result = {
         "date": delivery_date.strftime("%Y-%m-%d"),
         "signature": (delivery_date.isoformat(), start, tuple(stops), tuple(priorities), tuple(volumes),
-                      tuple(capacities)),
+                      tuple(capacities), strict_priority),
+        "strict_priority": strict_priority,
         "map": m, "vehicle_rows": vehicle_rows, "stop_rows": stop_rows, "handoff": handoff,
         "depot": {"name": start_name.strip(), "matched": start_matched},
         "opt_total": opt_total, "base_total": base_total,
@@ -644,6 +714,9 @@ def show_result(result):
     c2.metric(f"Saved vs entered order ({max(saved_pct, 0):.0f}%)", f"{max(base_km - opt_km, 0):.1f} km")
     c3.metric("Estimated fuel", f"{result['fuel_l']:.1f} L")
     c4.metric("Stops served", f"{len(result['served'])} / {result['total_stops']}")
+    st.caption("Order: high-priority stops first in every route." if result.get("strict_priority") else
+               "Order: shortest distance, with high-priority stops nudged earlier. "
+               "Turn on “High priority first” to always deliver them first.")
 
     if result["dropped"]:
         st.warning("Not enough vehicle capacity for: " + ", ".join(result["dropped"])

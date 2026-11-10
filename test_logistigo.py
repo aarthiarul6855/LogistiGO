@@ -21,6 +21,8 @@ import streamlit as st
 from geopy.distance import geodesic
 from streamlit.testing.v1 import AppTest
 
+from stop_import import MAX_STOPS, parse_stops_file, template_csv
+
 APP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logistigo.py")
 
 PLACES = {
@@ -84,7 +86,7 @@ class LogistigoTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmp, "test.db")
-        env = mock.patch.dict(os.environ, {"LOGISTIGO_DB": self.db_path})
+        env = mock.patch.dict(os.environ, {"LOGISTIGO_DB": self.db_path, "LOGISTIGO_GEOCODE_INTERVAL": "0"})
         env.start()
         self.addCleanup(env.stop)
         self.servers = FakeMapServers()
@@ -123,7 +125,7 @@ class LogistigoTestCase(unittest.TestCase):
     def assertNoExceptions(self, at):
         self.assertEqual([e.value for e in at.exception], [])
 
-    def plan(self, stops, capacities=(10.0,), start="Chennai Central", user="tester"):
+    def plan(self, stops, capacities=(10.0,), start="Chennai Central", user="tester", strict=False):
         """stops: list of (name, priority, volume). Fills the planner and submits it."""
         at = AppTest.from_file(APP, default_timeout=60)
         at.session_state.authenticated = True
@@ -135,6 +137,7 @@ class LogistigoTestCase(unittest.TestCase):
              "Volume (m³)": [v for _, _, v in stops]})
         at.run()
         at.text_input(key="start_location").set_value(start)
+        at.toggle(key="strict_priority").set_value(strict)
         self.button(at, "Plan routes").click()
         return at.run()
 
@@ -326,7 +329,7 @@ class LogistigoTestCase(unittest.TestCase):
         self.assertIn("Van 1 · 2 stops", page)
         self.assertIn("https://www.google.com/maps/dir/?", page)
         self.assertIn("Not delivered", page)
-        self.assertEqual(len(at.get("download_button")), 2)
+        self.assertEqual(len(at.get("download_button")), 3)  # template + two run sheets
 
     # -- per-user data ----------------------------------------------------
     def test_history_is_private_to_each_user(self):
@@ -356,6 +359,33 @@ class LogistigoTestCase(unittest.TestCase):
             self.assertIn("username", columns)
         self.assertEqual(self.texts(at.info), ["No delivery data yet. Plans you create are recorded here."])
 
+    # -- strict priority ---------------------------------------------------
+    # From the depot, Adyar is on the way to Tambaram, so the shortest route visits Adyar first.
+    def route_of(self, at, vehicle="Van 1"):
+        return [r["Location"] for r in at.session_state.result["stop_rows"] if r["Vehicle"] == vehicle]
+
+    def test_without_strict_priority_distance_wins(self):
+        at = self.plan([("Adyar", "low", 1.0), ("Tambaram", "high", 1.0)])
+        self.assertEqual(self.route_of(at), ["Adyar", "Tambaram"])
+        self.assertTrue(any("nudged earlier" in c.value for c in at.caption))
+
+    def test_strict_priority_puts_high_first(self):
+        at = self.plan([("Adyar", "low", 1.0), ("Tambaram", "high", 1.0)], strict=True)
+        self.assertNoExceptions(at)
+        self.assertEqual(self.route_of(at), ["Tambaram", "Adyar"])
+        self.assertTrue(any("high-priority stops first" in c.value for c in at.caption))
+
+    def test_strict_priority_orders_every_vehicle(self):
+        stops = [("Adyar", "low", 1.0), ("Point 3", "medium", 1.0), ("Tambaram", "high", 1.0),
+                 ("Guindy", "low", 1.0), ("Point 9", "high", 1.0), ("Anna Nagar", "medium", 1.0)]
+        at = self.plan(stops, capacities=(3.0, 3.0), strict=True)
+        rank = {"High": 1, "Medium": 2, "Low": 3}
+        rows = at.session_state.result["stop_rows"]
+        for vehicle in ("Van 1", "Van 2"):
+            ranks = [rank[r["Priority"]] for r in rows if r["Vehicle"] == vehicle]
+            self.assertEqual(ranks, sorted(ranks), f"{vehicle} visits a lower priority before a higher one")
+        self.assertEqual(len(at.session_state.result["served"]), 6)
+
     # -- other pages -----------------------------------------------------
     def test_heatmap_and_analytics_pages(self):
         at = self.plan([("Guindy", "high", 1.0)])
@@ -375,6 +405,63 @@ class LogistigoTestCase(unittest.TestCase):
         at = self.app(logged_in=True, page="Analytics")
         self.assertNoExceptions(at)
         self.assertEqual(self.texts(at.info), ["No delivery data yet. Plans you create are recorded here."])
+
+
+class StopImportTests(unittest.TestCase):
+    @staticmethod
+    def csv(*lines):
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    def test_template_round_trips(self):
+        stops, notes = parse_stops_file("template.csv", template_csv())
+        self.assertEqual(list(stops.columns), ["Location", "Priority", "Volume (m³)"])
+        self.assertEqual(len(stops), 3)
+        self.assertEqual(notes, [])
+
+    def test_header_aliases_defaults_and_blank_rows(self):
+        data = self.csv("Address,URGENCY,volume_m3", "Guindy,high,2", ",low,1", "  Adyar ,,")
+        stops, notes = parse_stops_file("stops.csv", data)
+        self.assertEqual(stops["Location"].tolist(), ["Guindy", "Adyar"])
+        self.assertEqual(stops["Priority"].tolist(), ["High", "Medium"])
+        self.assertEqual(stops["Volume (m³)"].tolist(), [2.0, 1.0])
+        self.assertEqual(len(notes), 1)  # Adyar's missing volume
+
+    def test_only_location_column_is_required(self):
+        stops, notes = parse_stops_file("stops.csv", self.csv("Location", "Guindy", "Adyar"))
+        self.assertEqual(stops["Priority"].tolist(), ["Medium", "Medium"])
+        self.assertEqual(stops["Volume (m³)"].tolist(), [1.0, 1.0])
+        self.assertEqual(notes, [])
+
+    def test_bad_values_are_reported(self):
+        data = self.csv("Location,Priority,Volume", "Guindy,urgent,-3", "Adyar,Low,abc")
+        stops, notes = parse_stops_file("stops.csv", data)
+        self.assertEqual(stops["Priority"].tolist(), ["Medium", "Low"])
+        self.assertEqual(stops["Volume (m³)"].tolist(), [1.0, 1.0])
+        self.assertTrue(any("'urgent'" in n for n in notes))
+        self.assertTrue(any("Guindy, Adyar" in n for n in notes))
+
+    def test_unusable_files_raise(self):
+        with self.assertRaisesRegex(ValueError, "Location"):
+            parse_stops_file("stops.csv", self.csv("City,Priority", "Chennai,High"))
+        with self.assertRaisesRegex(ValueError, "empty"):
+            parse_stops_file("stops.csv", self.csv("Location", "", " "))
+        with self.assertRaisesRegex(ValueError, ".csv or .xlsx"):
+            parse_stops_file("stops.txt", self.csv("Location", "Guindy"))
+
+    def test_excel_and_windows_encodings(self):
+        buffer = io.BytesIO()
+        pd.DataFrame({"Location": ["Guindy"], "Priority": ["Low"], "Volume (m³)": [2.5]}).to_excel(buffer, index=False)
+        stops, _ = parse_stops_file("stops.xlsx", buffer.getvalue())
+        self.assertEqual(stops.iloc[0].tolist(), ["Guindy", "Low", 2.5])
+        # Values containing commas are quoted, as Excel does when saving CSV.
+        stops, _ = parse_stops_file("stops.csv", 'Location\n"Café Coffee Day, Adyar"\n'.encode("cp1252"))
+        self.assertEqual(stops["Location"].tolist(), ["Café Coffee Day, Adyar"])
+
+    def test_large_files_are_capped(self):
+        data = self.csv("Location", *[f"Stop {i}" for i in range(MAX_STOPS + 5)])
+        stops, notes = parse_stops_file("stops.csv", data)
+        self.assertEqual(len(stops), MAX_STOPS)
+        self.assertTrue(any(f"first {MAX_STOPS}" in n for n in notes))
 
 
 if __name__ == "__main__":

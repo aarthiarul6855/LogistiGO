@@ -52,7 +52,17 @@ The database is not committed to git; it is created automatically on first run.
   everything can't fit the low-priority stops are left out first (and listed on screen).
 - The "unoptimised" comparison serves the same stops in the order you entered them, filling vehicle 1, then 2, etc.
 - Fuel is estimated as optimised distance ÷ the km-per-litre you enter.
+- "High priority first" (off by default) makes every vehicle visit all its high-priority stops, then medium,
+  then low, even when that means a longer drive. Off, priority only nudges the order.
 - Each distinct plan is saved to analytics once, however many times you click the button.
+
+## Importing stops
+
+Under "Import stops from a file", upload a CSV or Excel (.xlsx) file with a `Location` column (or `Address`)
+and optional `Priority` (High/Medium/Low) and `Volume (m³)` columns; "Download template" gives an example.
+The stops land in the table for review before planning. Missing or invalid values fall back to Medium priority
+and 1 m³, with a warning. Up to 200 stops; place lookups are limited to one per second, as Nominatim's
+usage policy requires, so a large file takes a little while the first time.
 - Analytics and the heatmap are per user: each account only sees its own history.
 - Every stop shows the address it was matched to, so a wrong lookup is easy to spot and fix.
 
