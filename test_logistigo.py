@@ -243,6 +243,24 @@ class LogistigoTestCase(unittest.TestCase):
         # fleet + stops editors, plus the per-vehicle results table
         self.assertEqual(len(at.dataframe), 3, "per-vehicle table should be shown")
 
+    def test_map_numbers_stops_in_visit_order(self):
+        stops = [("Guindy", "high", 1.0), ("Tambaram", "medium", 1.0), ("Anna Nagar", "low", 1.0),
+                 ("Adyar", "low", 1.0)]
+        at = self.plan(stops, capacities=(2.0, 1.0))  # room for 3 of the 4 stops
+        result = at.session_state.result
+        stop_layer = next(c for c in result["map"]._children.values()
+                          if getattr(c, "layer_name", None) == "Stops")
+        tooltips = sorted(child.text for marker in stop_layer._children.values()
+                          for child in marker._children.values() if hasattr(child, "text"))
+        expected = []
+        for row in result["vehicle_rows"]:
+            for n, name in enumerate(row["Route"].split(" → "), start=1):
+                priority = dict((s[0], s[1]) for s in stops)[name].capitalize()
+                expected.append(f"{row['Vehicle']} · Stop {n} · {name} · {priority} priority")
+        expected += [f"Not delivered · {name} · Low priority" for name in result["dropped"]]
+        self.assertEqual(tooltips, sorted(expected))
+        self.assertEqual(len(result["dropped"]), 1)
+
     def test_repeat_submit_saves_once_and_results_persist(self):
         at = self.plan([("Guindy", "high", 1.0), ("Adyar", "low", 1.0)])
         first = self.db("SELECT total_deliveries, total_distance, fuel_consumed FROM delivery_summary")

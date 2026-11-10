@@ -314,16 +314,36 @@ def base_map(location, zoom):
     return m
 
 
-def build_map(start, stops, names, priorities):
+def stop_icon(label, fill, outline, size=26):
+    """Round numbered badge: fill = vehicle colour, outline = priority colour."""
+    return folium.DivIcon(
+        icon_size=(size, size), icon_anchor=(size // 2, size // 2),
+        html=(f'<div style="width:{size}px;height:{size}px;border-radius:50%;background:{fill};'
+              f'border:3px solid {outline};box-sizing:border-box;color:#fff;font:600 12px/20px '
+              f'system-ui,sans-serif;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.35)">{label}</div>'),
+    )
+
+
+def build_map(start, stops, names, priorities, routes, vehicle_names):
+    """Depot plus every stop, numbered in the order its vehicle visits it.
+    Stops that couldn't be served are shown greyed out without a number."""
     m = base_map(list(start), 12)
     folium.Marker(list(start), tooltip="Depot", icon=folium.Icon(color="black", icon="home")).add_to(m)
     stop_layer = folium.FeatureGroup(name="Stops")
+    position = {}
+    for v, route in enumerate(routes):
+        for n, s in enumerate(route, start=1):
+            position[s] = (v, n)
     for s, point in enumerate(stops):
-        folium.CircleMarker(
-            point, radius=7, weight=2, color="#FFFFFF", fill=True, fill_opacity=1,
-            fill_color=PRIORITY_COLOR[priorities[s]],
-            tooltip=f"{names[s]} · {priorities[s].capitalize()} priority",
-        ).add_to(stop_layer)
+        priority = f"{priorities[s].capitalize()} priority"
+        if s in position:
+            v, n = position[s]
+            icon = stop_icon(n, ROUTE_COLORS[v % len(ROUTE_COLORS)], PRIORITY_COLOR[priorities[s]])
+            tooltip = f"{vehicle_names[v]} · Stop {n} · {names[s]} · {priority}"
+        else:
+            icon = stop_icon("–", "#9AA3AF", PRIORITY_COLOR[priorities[s]])
+            tooltip = f"Not delivered · {names[s]} · {priority}"
+        folium.Marker(point, icon=icon, tooltip=tooltip).add_to(stop_layer)
     stop_layer.add_to(m)
     m.fit_bounds([list(start)] + [list(p) for p in stops])
     return m
@@ -492,7 +512,7 @@ def run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df):
     with st.spinner("Planning routes…"):
         dist = distance_matrix([start] + stops)
         routes, dropped = plan_routes(dist, volumes, priorities, capacities)
-        m = build_map(start, stops, names, priorities)
+        m = build_map(start, stops, names, priorities, routes, vehicle_names)
         opt_info, opt_total = add_routes_to_map(m, start, stops, routes, names, vehicle_names, "Optimised")
         served = [s for route in routes for s in route]
         base = baseline_routes(served, volumes, capacities)
@@ -540,9 +560,9 @@ def show_result(result):
                    + ". Lower-priority stops were left out first.")
 
     st.dataframe(pd.DataFrame(result["vehicle_rows"]), hide_index=True, use_container_width=True)
-    st.caption("Map: solid lines are the optimised routes. Turn on “Entered order” in the map’s layer menu "
-               "to compare with visiting stops in the order you typed them. "
-               "Stop colours: red = high, amber = medium, green = low priority.")
+    st.caption("Map: numbers show the order each vehicle visits its stops, in that vehicle's route colour; "
+               "the outline shows priority (red high, amber medium, green low). Turn on “Entered order” "
+               "in the map’s layer menu to compare with visiting stops in the order you typed them.")
     st_folium(result["map"], key="plan_map", height=520, use_container_width=True, returned_objects=[])
 
 
