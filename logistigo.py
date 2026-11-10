@@ -1,9 +1,11 @@
 import os
 import hashlib
 import hmac
+import html
 import secrets
 import sqlite3
 from datetime import datetime
+from urllib.parse import urlencode
 
 import altair as alt
 import folium
@@ -50,7 +52,7 @@ def get_connection(path):
 
 conn = get_connection(DB_PATH)
 conn.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT, password TEXT)''')
-conn.execute('''CREATE TABLE IF NOT EXISTS heatmap_points (lat REAL, lon REAL)''')
+conn.execute('''CREATE TABLE IF NOT EXISTS heatmap_points (lat REAL, lon REAL, username TEXT)''')
 conn.execute('''CREATE TABLE IF NOT EXISTS delivery_summary (
     date TEXT,
     fuel_consumed REAL,
@@ -59,8 +61,14 @@ conn.execute('''CREATE TABLE IF NOT EXISTS delivery_summary (
     priority_high INTEGER,
     priority_medium INTEGER,
     priority_low INTEGER,
-    total_distance REAL
+    total_distance REAL,
+    username TEXT
 )''')  # total_distance is stored in metres (kept for compatibility with old rows)
+# Databases created before history was per-user lack the username column; add it.
+# Rows saved before then have no owner and are not shown to anyone until assigned.
+for _table in ("heatmap_points", "delivery_summary"):
+    if "username" not in [col[1] for col in conn.execute(f"PRAGMA table_info({_table})").fetchall()]:
+        conn.execute(f"ALTER TABLE {_table} ADD COLUMN username TEXT")
 conn.commit()
 
 
@@ -131,19 +139,21 @@ def _geocode_cached(location_name):
     response.raise_for_status()
     results = response.json()
     if results:
-        return float(results[0]["lat"]), float(results[0]["lon"])
-    return None, None
+        top = results[0]
+        return float(top["lat"]), float(top["lon"]), top.get("display_name", location_name)
+    return None, None, None
 
 
 def geocode_location(location_name):
+    """Returns (lat, lon, matched_address); all None if the place wasn't found."""
     location_name = location_name.strip()
     if not location_name:
-        return None, None
+        return None, None, None
     try:
         return _geocode_cached(location_name)
     except Exception as e:
         st.error(f"Geocoding error for '{location_name}': {e}")
-        return None, None
+        return None, None, None
 
 
 def get_osm_route(locations):
@@ -354,16 +364,18 @@ def format_duration(seconds):
     return f"{minutes // 60} h {minutes % 60:02d} min" if minutes >= 60 else f"{minutes} min"
 
 
-def save_run(result):
-    """Record a plan in analytics and the heatmap (once per distinct plan)."""
-    if result["signature"] in st.session_state.saved_runs or not result["served"]:
+def save_run(result, username):
+    """Record a plan in this user's analytics and heatmap (once per distinct plan)."""
+    key = (username, result["signature"])
+    if key in st.session_state.saved_runs or not result["served"]:
         return
     for lat, lon in result["served_points"]:
-        conn.execute('INSERT INTO heatmap_points (lat, lon) VALUES (?, ?)', (lat, lon))
+        conn.execute('INSERT INTO heatmap_points (lat, lon, username) VALUES (?, ?, ?)', (lat, lon, username))
     pr = result["served_priorities"]
     values = (result["fuel_l"], len(result["served"]), len(result["vehicle_rows"]),
               pr.count("high"), pr.count("medium"), pr.count("low"), result["opt_total"])
-    if conn.execute("SELECT 1 FROM delivery_summary WHERE date = ?", (result["date"],)).fetchall():
+    owner = (result["date"], username)
+    if conn.execute("SELECT 1 FROM delivery_summary WHERE date = ? AND username = ?", owner).fetchall():
         conn.execute('''UPDATE delivery_summary SET
                     fuel_consumed = fuel_consumed + ?,
                     total_deliveries = total_deliveries + ?,
@@ -372,13 +384,67 @@ def save_run(result):
                     priority_medium = priority_medium + ?,
                     priority_low = priority_low + ?,
                     total_distance = total_distance + ?
-                    WHERE date = ?''', values + (result["date"],))
+                    WHERE date = ? AND username = ?''', values + owner)
     else:
         conn.execute('''INSERT INTO delivery_summary (date, fuel_consumed, total_deliveries, vehicles_used,
-                    priority_high, priority_medium, priority_low, total_distance)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', (result["date"],) + values)
+                    priority_high, priority_medium, priority_low, total_distance, username)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', (result["date"],) + values + (username,))
     conn.commit()
-    st.session_state.saved_runs.add(result["signature"])
+    st.session_state.saved_runs.add(key)
+
+
+# ---------------------------------------------------------------------------
+# Driver hand-off
+# ---------------------------------------------------------------------------
+MAPS_MAX_WAYPOINTS = 9  # Google Maps URLs accept at most 9 stops between origin and destination
+
+
+def google_maps_links(start, points):
+    """Google Maps driving directions from the depot through `points` in order.
+    Long routes are split into consecutive legs, each starting where the last ended."""
+    path = [start] + list(points)
+    fmt = lambda p: f"{p[0]:.6f},{p[1]:.6f}"
+    links, i = [], 0
+    while i < len(path) - 1:
+        leg = path[i:i + MAPS_MAX_WAYPOINTS + 2]
+        params = {"api": "1", "origin": fmt(leg[0]), "destination": fmt(leg[-1]), "travelmode": "driving"}
+        if len(leg) > 2:
+            params["waypoints"] = "|".join(fmt(p) for p in leg[1:-1])
+        links.append("https://www.google.com/maps/dir/?" + urlencode(params))
+        i += len(leg) - 1
+    return links
+
+
+def run_sheet_html(result):
+    """Printable run sheet: one table per vehicle, with its Google Maps link(s)."""
+    esc = html.escape
+    parts = [
+        "<!doctype html><html><head><meta charset='utf-8'><title>Run sheet</title><style>"
+        "body{font:14px/1.45 system-ui,sans-serif;color:#1C2430;margin:32px}"
+        "h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 6px}"
+        "p.meta{color:#5B6574;margin:0 0 4px}table{border-collapse:collapse;width:100%}"
+        "th,td{border:1px solid #D5DAE1;padding:6px 8px;text-align:left;vertical-align:top}"
+        "th{background:#F3F5F8}a{color:#1F5FAD}@media print{body{margin:12mm}h2{break-after:avoid}"
+        "table{break-inside:auto}tr{break-inside:avoid}}</style></head><body>",
+        f"<h1>Run sheet · {esc(result['date'])}</h1>",
+        f"<p class='meta'>Depot: {esc(result['depot']['name'])} ({esc(result['depot']['matched'])})</p>",
+    ]
+    for vehicle in result["handoff"]:
+        rows = [r for r in result["stop_rows"] if r["Vehicle"] == vehicle["vehicle"]]
+        parts.append(f"<h2>{esc(vehicle['vehicle'])} · {len(rows)} stops · {esc(vehicle['summary'])}</h2>")
+        for n, link in enumerate(vehicle["links"], start=1):
+            label = "Open in Google Maps" + (f" (part {n} of {len(vehicle['links'])})" if len(vehicle["links"]) > 1 else "")
+            parts.append(f"<p><a href='{esc(link)}'>{label}</a></p>")
+        parts.append("<table><tr><th>#</th><th>Location</th><th>Matched address</th><th>Priority</th>"
+                     "<th>Volume (m³)</th><th>Done</th></tr>")
+        for r in rows:
+            parts.append(f"<tr><td>{r['Stop']}</td><td>{esc(r['Location'])}</td><td>{esc(r['Matched address'])}</td>"
+                         f"<td>{esc(r['Priority'])}</td><td>{r['Volume (m³)']:.2f}</td><td>☐</td></tr>")
+        parts.append("</table>")
+    if result["dropped"]:
+        parts.append("<h2>Not delivered (no vehicle had room)</h2><p>" + esc(", ".join(result["dropped"])) + "</p>")
+    parts.append("</body></html>")
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -485,20 +551,22 @@ def run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df):
         return
 
     with st.spinner("Looking up locations…"):
-        start = geocode_location(start_name)
-        names, stops, priorities, volumes, not_found = [], [], [], [], []
+        start_lat, start_lon, start_matched = geocode_location(start_name)
+        start = (start_lat, start_lon)
+        names, stops, matched, priorities, volumes, not_found = [], [], [], [], [], []
         for _, row in rows.iterrows():
             name = str(row["Location"]).strip()
-            point = geocode_location(name)
-            if point[0] is None:
+            lat, lon, address = geocode_location(name)
+            if lat is None:
                 not_found.append(name)
                 continue
             names.append(name)
-            stops.append(point)
+            stops.append((lat, lon))
+            matched.append(address)
             priorities.append(str(row.get("Priority") or "Medium").lower())
             volumes.append(float(row.get("Volume (m³)") or 1.0))
 
-    if start[0] is None:
+    if start_lat is None:
         st.error(f"Couldn't find the depot “{start_name.strip()}”. Try a more specific name.")
         return
     if not_found:
@@ -529,11 +597,30 @@ def run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df):
         "Drive time": format_duration(i["duration_s"]),
     } for i in opt_info]
 
-    st.session_state.result = {
+    # Every stop with the address it was matched to, in visit order; unserved stops last.
+    stop_rows = []
+    for i in opt_info:
+        for n, s in enumerate(i["stops"], start=1):
+            stop_rows.append({"Vehicle": vehicle_names[i["vehicle"]], "Stop": n, "Location": names[s],
+                              "Matched address": matched[s], "Priority": priorities[s].capitalize(),
+                              "Volume (m³)": volumes[s], "Latitude": stops[s][0], "Longitude": stops[s][1]})
+    for s in dropped:
+        stop_rows.append({"Vehicle": "Not delivered", "Stop": None, "Location": names[s],
+                          "Matched address": matched[s], "Priority": priorities[s].capitalize(),
+                          "Volume (m³)": volumes[s], "Latitude": stops[s][0], "Longitude": stops[s][1]})
+
+    handoff = [{
+        "vehicle": vehicle_names[i["vehicle"]],
+        "summary": f"{i['distance_m'] / 1000:.1f} km, {format_duration(i['duration_s'])}",
+        "links": google_maps_links(start, [stops[s] for s in i["stops"]]),
+    } for i in opt_info]
+
+    result = {
         "date": delivery_date.strftime("%Y-%m-%d"),
         "signature": (delivery_date.isoformat(), start, tuple(stops), tuple(priorities), tuple(volumes),
                       tuple(capacities)),
-        "map": m, "vehicle_rows": vehicle_rows,
+        "map": m, "vehicle_rows": vehicle_rows, "stop_rows": stop_rows, "handoff": handoff,
+        "depot": {"name": start_name.strip(), "matched": start_matched},
         "opt_total": opt_total, "base_total": base_total,
         "fuel_l": opt_total / 1000 / km_per_litre,
         "served": served, "total_stops": len(stops),
@@ -541,7 +628,10 @@ def run_planner(start_name, delivery_date, km_per_litre, vehicles, stops_df):
         "served_points": [stops[s] for s in served],
         "served_priorities": [priorities[s] for s in served],
     }
-    save_run(st.session_state.result)
+    result["run_sheet_csv"] = pd.DataFrame(stop_rows).to_csv(index=False).encode("utf-8")
+    result["run_sheet_html"] = run_sheet_html(result)
+    st.session_state.result = result
+    save_run(result, st.session_state.username)
 
 
 def show_result(result):
@@ -559,11 +649,40 @@ def show_result(result):
         st.warning("Not enough vehicle capacity for: " + ", ".join(result["dropped"])
                    + ". Lower-priority stops were left out first.")
 
-    st.dataframe(pd.DataFrame(result["vehicle_rows"]), hide_index=True, use_container_width=True)
+    vehicles_tab, stops_tab = st.tabs(["Vehicles", "Stops and matched addresses"])
+    with vehicles_tab:
+        st.dataframe(pd.DataFrame(result["vehicle_rows"]), hide_index=True, use_container_width=True)
+    with stops_tab:
+        st.caption(f"Depot “{result['depot']['name']}” matched to: {result['depot']['matched']}. "
+                   "Check each address below; if one is wrong, make that location more specific "
+                   "(add the area, city or postcode) and plan again.")
+        st.dataframe(pd.DataFrame(result["stop_rows"]).drop(columns=["Latitude", "Longitude"]),
+                     hide_index=True, use_container_width=True,
+                     column_config={"Stop": st.column_config.NumberColumn(format="%d"),
+                                    "Volume (m³)": st.column_config.NumberColumn(format="%.2f")})
+
     st.caption("Map: numbers show the order each vehicle visits its stops, in that vehicle's route colour; "
                "the outline shows priority (red high, amber medium, green low). Turn on “Entered order” "
                "in the map’s layer menu to compare with visiting stops in the order you typed them.")
     st_folium(result["map"], key="plan_map", height=520, use_container_width=True, returned_objects=[])
+
+    st.subheader("Driver hand-off")
+    st.caption("Send each driver their route. Google Maps opens with the stops in order; routes with more "
+               f"than {MAPS_MAX_WAYPOINTS + 1} stops are split into parts, each starting where the last ended.")
+    for vehicle in result["handoff"]:
+        name_col, link_col = st.columns([1, 2], vertical_alignment="center")
+        name_col.markdown(f"**{vehicle['vehicle']}**  \n{vehicle['summary']}")
+        with link_col:
+            buttons = st.columns(len(vehicle["links"]))
+            for n, (col, link) in enumerate(zip(buttons, vehicle["links"]), start=1):
+                label = "Open in Google Maps" if len(vehicle["links"]) == 1 else f"Part {n}"
+                col.link_button(label, link, use_container_width=True)
+    d1, d2, _ = st.columns([1, 1, 2])
+    d1.download_button("Run sheet (CSV)", result["run_sheet_csv"], file_name=f"run-sheet-{result['date']}.csv",
+                       mime="text/csv", use_container_width=True)
+    d2.download_button("Printable run sheet", result["run_sheet_html"].encode("utf-8"),
+                       file_name=f"run-sheet-{result['date']}.html", mime="text/html",
+                       use_container_width=True, help="Open in a browser and print (Ctrl+P).")
 
 
 def integer_ticks(max_value, target=6):
@@ -574,7 +693,8 @@ def integer_ticks(max_value, target=6):
 
 def page_analytics():
     st.header("Analytics")
-    df = pd.read_sql_query("SELECT * FROM delivery_summary", conn)
+    df = pd.read_sql_query("SELECT * FROM delivery_summary WHERE username = ?", conn,
+                           params=(st.session_state.username,))
     if df.empty:
         st.info("No delivery data yet. Plans you create are recorded here.")
         return
@@ -634,8 +754,9 @@ def page_analytics():
 
 def page_heatmap():
     st.header("Delivery heatmap")
-    points = conn.execute('SELECT lat, lon FROM heatmap_points').fetchall()
-    st.caption(f"{len(points)} delivered stops recorded.")
+    points = conn.execute('SELECT lat, lon FROM heatmap_points WHERE username = ?',
+                          (st.session_state.username,)).fetchall()
+    st.caption(f"{len(points)} of your delivered stops recorded.")
     m = base_map([20, 78], 4)
     if points:
         # max_zoom=1: leaflet.heat divides each point's weight by 2 for every zoom level below
@@ -651,10 +772,10 @@ def page_heatmap():
     st_folium(m, key="heatmap", height=560, use_container_width=True, returned_objects=[])
     if points:
         with st.expander("Manage data"):
-            st.write("Remove all recorded points from the heatmap. Analytics are not affected.")
+            st.write("Remove all of your recorded points from the heatmap. Analytics and other users are not affected.")
             confirm = st.checkbox("I understand this can't be undone", key="confirm_clear")
             if st.button("Clear heatmap", disabled=not confirm):
-                conn.execute('DELETE FROM heatmap_points')
+                conn.execute('DELETE FROM heatmap_points WHERE username = ?', (st.session_state.username,))
                 conn.commit()
                 st.session_state.pop("confirm_clear", None)
                 st.rerun()

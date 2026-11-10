@@ -53,3 +53,11 @@ The database is not committed to git; it is created automatically on first run.
 - The "unoptimised" comparison serves the same stops in the order you entered them, filling vehicle 1, then 2, etc.
 - Fuel is estimated as optimised distance ÷ the km-per-litre you enter.
 - Each distinct plan is saved to analytics once, however many times you click the button.
+- Analytics and the heatmap are per user: each account only sees its own history.
+- Every stop shows the address it was matched to, so a wrong lookup is easy to spot and fix.
+
+## Driver hand-off
+
+- Each vehicle gets an "Open in Google Maps" button with its stops in order. Google Maps links hold at most
+  10 stops, so longer routes are split into parts that each start where the previous one ended.
+- Download the plan as a CSV run sheet, or as a printable run sheet (open it in a browser and print).

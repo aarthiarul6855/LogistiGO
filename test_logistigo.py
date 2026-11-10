@@ -6,12 +6,14 @@ The Nominatim/OSRM servers are replaced with a fake that uses straight-line
 distances, and each test uses its own temporary database.
 """
 import hashlib
+import io
 import os
 import shutil
 import sqlite3
 import tempfile
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
@@ -28,6 +30,8 @@ PLACES = {
     "Anna Nagar": (13.0850, 80.2101),
     "Adyar": (13.0012, 80.2565),
 }
+# A long line of stops for testing routes that need several Google Maps links.
+PLACES.update({f"Point {i}": (13.0 + i * 0.01, 80.20 + i * 0.005) for i in range(1, 13)})
 
 
 class FakeResponse:
@@ -58,7 +62,8 @@ class FakeMapServers:
         if "nominatim" in url:
             self.geocode_calls += 1
             place = PLACES.get(params["q"])
-            return FakeResponse([{"lat": place[0], "lon": place[1]}] if place else [])
+            return FakeResponse([{"lat": place[0], "lon": place[1],
+                                  "display_name": f"{params['q']}, Chennai, Tamil Nadu, India"}] if place else [])
         points = self._points(url)
         if "/table/" in url:
             return FakeResponse({"distances": [[geodesic(a, b).m for b in points] for a in points]})
@@ -90,11 +95,11 @@ class LogistigoTestCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)  # db may still be open on Windows
 
     # -- helpers ---------------------------------------------------------
-    def app(self, logged_in=False, page=None):
+    def app(self, logged_in=False, page=None, user="tester"):
         at = AppTest.from_file(APP, default_timeout=60)
         if logged_in:
             at.session_state.authenticated = True
-            at.session_state.username = "tester"
+            at.session_state.username = user
         at.run()
         if page:
             at.radio(key="page").set_value(page).run()
@@ -118,11 +123,11 @@ class LogistigoTestCase(unittest.TestCase):
     def assertNoExceptions(self, at):
         self.assertEqual([e.value for e in at.exception], [])
 
-    def plan(self, stops, capacities=(10.0,), start="Chennai Central"):
+    def plan(self, stops, capacities=(10.0,), start="Chennai Central", user="tester"):
         """stops: list of (name, priority, volume). Fills the planner and submits it."""
         at = AppTest.from_file(APP, default_timeout=60)
         at.session_state.authenticated = True
-        at.session_state.username = "tester"
+        at.session_state.username = user
         at.session_state.vehicles_input = pd.DataFrame(
             {"Vehicle": [f"Van {i + 1}" for i in range(len(capacities))], "Capacity (m³)": list(capacities)})
         at.session_state.stops_input = pd.DataFrame(
@@ -240,8 +245,8 @@ class LogistigoTestCase(unittest.TestCase):
         rows = at.session_state.result["vehicle_rows"]
         self.assertEqual(len(rows), 2)  # 16 m³ can't fit in one 10 m³ vehicle
         self.assertEqual(sum(r["Stops"] for r in rows), 4)
-        # fleet + stops editors, plus the per-vehicle results table
-        self.assertEqual(len(at.dataframe), 3, "per-vehicle table should be shown")
+        # fleet + stops editors, plus the per-vehicle and per-stop results tables
+        self.assertEqual(len(at.dataframe), 4, "results tables should be shown")
 
     def test_map_numbers_stops_in_visit_order(self):
         stops = [("Guindy", "high", 1.0), ("Tambaram", "medium", 1.0), ("Anna Nagar", "low", 1.0),
@@ -273,6 +278,83 @@ class LogistigoTestCase(unittest.TestCase):
         deliveries, distance_m, fuel = first[0]
         self.assertEqual(deliveries, 2)
         self.assertAlmostEqual(fuel, distance_m / 1000 / 8.0, places=6)  # default 8 km/L
+
+    # -- matched addresses and driver hand-off ------------------------------
+    def test_matched_addresses_are_shown(self):
+        at = self.plan([("Guindy", "high", 1.0), ("Adyar", "low", 1.0)], capacities=(1.0,))
+        result = at.session_state.result
+        self.assertEqual(result["depot"]["matched"], "Chennai Central, Chennai, Tamil Nadu, India")
+        by_name = {r["Location"]: r for r in result["stop_rows"]}
+        self.assertEqual(by_name["Guindy"]["Matched address"], "Guindy, Chennai, Tamil Nadu, India")
+        self.assertEqual(by_name["Adyar"]["Vehicle"], "Not delivered")  # dropped stops are still listed
+
+    def test_google_maps_link_follows_visit_order(self):
+        at = self.plan([("Guindy", "high", 1.0), ("Tambaram", "low", 1.0), ("Adyar", "low", 1.0)])
+        result = at.session_state.result
+        [vehicle] = result["handoff"]
+        [link] = vehicle["links"]
+        query = parse_qs(urlparse(link).query)
+        route = [r["Location"] for r in result["stop_rows"] if r["Vehicle"] == "Van 1"]
+        fmt = lambda name: "{:.6f},{:.6f}".format(*PLACES[name])
+        self.assertEqual(query["origin"], [fmt("Chennai Central")])
+        self.assertEqual(query["waypoints"], ["|".join(fmt(n) for n in route[:-1])])
+        self.assertEqual(query["destination"], [fmt(route[-1])])
+        self.assertEqual(query["travelmode"], ["driving"])
+
+    def test_long_route_is_split_into_connected_maps_links(self):
+        stops = [(f"Point {i}", "low", 0.5) for i in range(1, 13)]
+        at = self.plan(stops, capacities=(10.0,))
+        links = at.session_state.result["handoff"][0]["links"]
+        self.assertEqual(len(links), 2)  # 12 stops: 9 waypoints + destination, then the remaining 2
+        legs = [parse_qs(urlparse(link).query) for link in links]
+        for leg in legs:
+            self.assertLessEqual(len(leg.get("waypoints", [""])[0].split("|")), 9)
+        self.assertEqual(legs[1]["origin"], legs[0]["destination"], "part 2 must start where part 1 ends")
+        visited = sum(len(leg.get("waypoints", [""])[0].split("|")) + 1 for leg in legs)
+        self.assertEqual(visited, 12)
+
+    def test_run_sheets(self):
+        at = self.plan([("Guindy", "high", 1.0), ("Tambaram", "low", 1.0), ("Adyar", "low", 1.0)],
+                       capacities=(2.0,))
+        result = at.session_state.result
+        sheet = pd.read_csv(io.BytesIO(result["run_sheet_csv"]))
+        self.assertEqual(list(sheet.columns), ["Vehicle", "Stop", "Location", "Matched address", "Priority",
+                                               "Volume (m³)", "Latitude", "Longitude"])
+        self.assertEqual(len(sheet), 3)
+        self.assertEqual((sheet["Vehicle"] == "Not delivered").sum(), 1)
+        page = result["run_sheet_html"]
+        self.assertIn("Van 1 · 2 stops", page)
+        self.assertIn("https://www.google.com/maps/dir/?", page)
+        self.assertIn("Not delivered", page)
+        self.assertEqual(len(at.get("download_button")), 2)
+
+    # -- per-user data ----------------------------------------------------
+    def test_history_is_private_to_each_user(self):
+        self.plan([("Guindy", "high", 1.0)], user="alice")
+        alice = self.app(logged_in=True, page="Analytics", user="alice")
+        self.assertEqual({m.label: m.value for m in alice.metric}["Deliveries"], "1")
+        bob = self.app(logged_in=True, page="Analytics", user="bob")
+        self.assertEqual(self.texts(bob.info), ["No delivery data yet. Plans you create are recorded here."])
+        bob.radio(key="page").set_value("Heatmap").run()
+        self.assertTrue(any("0 of your delivered stops" in c.value for c in bob.caption))
+        # Bob clearing his heatmap must not touch Alice's points.
+        self.assertEqual(self.db("SELECT username, COUNT(*) FROM heatmap_points GROUP BY username"), [("alice", 1)])
+
+    def test_old_database_is_migrated(self):
+        con = sqlite3.connect(self.db_path)
+        con.execute("CREATE TABLE heatmap_points (lat REAL, lon REAL)")
+        con.execute("CREATE TABLE delivery_summary (date TEXT, fuel_consumed REAL, total_deliveries INTEGER, "
+                    "vehicles_used INTEGER, priority_high INTEGER, priority_medium INTEGER, "
+                    "priority_low INTEGER, total_distance REAL)")
+        con.execute("INSERT INTO delivery_summary VALUES ('2025-05-03', 1, 5, 1, 1, 2, 2, 1000)")
+        con.commit()
+        con.close()
+        at = self.app(logged_in=True, page="Analytics")
+        self.assertNoExceptions(at)
+        for table in ("heatmap_points", "delivery_summary"):
+            columns = [c[1] for c in self.db(f"PRAGMA table_info({table})")]
+            self.assertIn("username", columns)
+        self.assertEqual(self.texts(at.info), ["No delivery data yet. Plans you create are recorded here."])
 
     # -- other pages -----------------------------------------------------
     def test_heatmap_and_analytics_pages(self):
